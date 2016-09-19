@@ -1,0 +1,198 @@
+#!/bin/bash
+
+SEND_INTERVAL=60
+MESSAGE_DIR="spool"
+CONFIG_FILE="../conf/delayed_pushd.conf"
+FIND_TMP="delayed_push.find"
+DELAYED_PID="delayed_push.pid"
+SEARCH_PATTERN="*_*.msgpack"            #rpcid_random.msgpack
+BASE_DIR=""
+
+LOG_LEVELS=("", "", "", "error", "notice", "warning", "info", "debug") 
+declare -A LOG_DICT
+LOG_DICT=(["error"]=3 ["notice"]=4 ["warning"]=5 ["info"]=6 ["debug"]=7) 
+LOG_LEVEL=6
+LOG_FILE="/dev/stdout"
+
+function help()
+{
+	echo '''
+Usage:
+	-c config_file   #set config file
+	'''
+}
+
+function log()
+{
+	if [ $# -lt 1 ]; then
+		return
+	fi
+	level=$1
+	if [ ${LOG_DICT[$level]} -le $LOG_LEVEL ]; then
+		shift
+		echo "[$$] [`date +%Y/%m/%d\ %H:%M:%S`] [$level] $@" >> $LOG_FILE
+	fi
+}
+
+function setpid()
+{
+	log debug "Set pid to file $DELAYED_PID"
+	echo $$ > $DELAYED_PID
+}
+
+function daemon_exit()
+{
+	log info "In daemon exit"
+	rm -f $DELAYED_PID 2> /dev/null
+	rm -r $BASE_DIR/$FIND_TMP 2> /dev/null
+	exit 1
+}
+
+function handler_init()
+{
+	trap daemon_exit 15
+	trap daemon_exit 2
+}
+
+function config_init()
+{
+	config_file=$1
+	if [ ! -e $config_file ]; then
+		log error "Config file $config_file not existed"
+		return 1
+	fi
+	if [ -d $config_file ]; then
+		log error "Config file should not be dir"
+		return 1
+	fi
+
+	tmp=`grep "BaseDir" $config_file`
+	if [ $? -ne 0 ]; then
+		log error "No BaseDir in config file"
+		return 1
+	fi
+	BASE_DIR=`echo $tmp | awk -F'"' '{print $4}'`
+
+	tmp=`grep LogFile $config_file`
+	if [ $? -ne 0 ]; then
+		log info "No LogFile in config file, log to stdout"
+	else
+		LOG_FILE=`echo $tmp | awk -F'"' '{print $4}'`
+		echo "$LOG_FILE" | grep "^/" > /dev/null
+		if [ $? -ne 0 ]; then
+			LOG_FILE=${BASE_DIR}/${LOG_FILE}
+		fi
+	fi
+	log debug "Log file is ${LOG_FILE}"
+
+	tmp=`grep LogLevel $config_file`
+	if [ $? -ne 0 ]; then
+		log info "No LogLevel in config file, use default: ${LOG_LEVELS[$LOG_LEVEL]}"
+	else
+		LOG_LEVEL=`echo $tmp | awk -F':' '{print $2}' | awk -F',' '{print $1}' | sed 's/ //g'`
+	fi
+	log debug "Log level is ${LOG_LEVELS[$LOG_LEVEL]}"
+
+	tmp=`grep "PidFile" $config_file`
+	if [ $? -ne 0 ]; then
+		log info "No PidFile in config file, use default: $DELAYED_PID"
+	else 
+		DELAYED_PID=`echo $tmp | awk -F'"' '{print $4}'`
+		echo "$DELAYED_PID" | grep "^/" > /dev/null
+		if [ $? -ne 0 ]; then
+			DELAYED_PID=${BASE_DIR}/${DELAYED_PID}
+		fi
+	fi
+
+	log debug "Pid is $DELAYED_PID"
+
+	tmp=`grep "SendInterval" $config_file`
+	if [ $? -ne 0 ]; then
+		log info "No SendInterval in config file, use default: $SEND_INTERVAL"
+	else 
+		SEND_INTERVAL=`echo $tmp | awk -F':' '{print $2}' | awk -F',' '{print $1}' | sed 's/ //g'`
+	fi
+	log debug "Send interval is $SEND_INTERVAL"
+
+	tmp=`grep "OfflinePushdAddr" $config_file`
+	if [ $? -ne 0 ]; then
+		log error "No OfflinePushdAddr in config file"
+		return 1
+	fi
+	tmp=`echo $tmp | awk -F'"' '{print $4}'`
+	OFFLINE_PUSHD_IP=${tmp%:*}
+	OFFLINE_PUSHD_PORT=${tmp#*:}
+	
+	log debug "Offline pushd addr is $OFFLINE_PUSHD_IP:$OFFLINE_PUSHD_PORT"
+
+	tmp=`grep "MessageDir" $config_file`
+	if [ $? -ne 0 ]; then
+		log info "No MessageDir in config file, use default: $MESSAGE_DIR"
+	else 
+		MESSAGE_DIR=`echo $tmp | awk -F'"' '{print $4}'`
+		echo "$MESSAGE_DIR" | grep "^/" > /dev/null
+		if [ $? -ne 0 ]; then
+			MESSAGE_DIR=${BASE_DIR}/${MESSAGE_DIR}
+		fi
+	fi
+
+	log debug "Message dir is $MESSAGE_DIR"
+}
+
+function do_collect
+{
+	while :; do
+		sleep $SEND_INTERVAL
+		tm=`date +%s`
+		let tm=tm-60
+		find $BASE_DIR/$MESSAGE_DIR -name "$SEARCH_PATTERN" > $BASE_DIR/$FIND_TMP 2>/dev/null
+		if [ `wc -l $BASE_DIR/$FIND_TMP | awk '{print $1}'` -eq 0 ]; then
+			rm -f $BASE_DIR/$FIND_TMP
+			log info "No message"
+			continue
+		fi
+
+		for i in `cat $BASE_DIR/$FIND_TMP`; do
+			file_tm=`dirname $i | xargs -i -r basename {}`
+			if [ $file_tm -le $tm ]; then
+				nc $OFFLINE_PUSHD_IP $OFFLINE_PUSHD_PORT --send-only < $i
+		   		if [ $? -eq 0 ]; then
+				 	log info "Push $i to $OFFLINE_PUSHD_IP:$OFFLINE_PUSHD_PORT done"
+					rm -r `dirname $i`
+				else
+					log error "Push $i to $OFFLINE_PUSHD_IP:$OFFLINE_PUSHD_PORT failed"
+				fi
+			fi
+		done
+
+		rm -f $BASE_DIR/$FIND_TMP
+	done
+}
+
+function main() {
+	if [ $# -ne 0 -a $# -ne 2 ]; then
+		help
+		return 1
+	fi
+	if [ $# -eq 2 -a "$1" != "-c" ]; then
+		help
+		return 1
+	fi
+
+	if [ $# -eq 0 ]; then
+		config_init $CONFIG_FILE
+	else 
+		config_init $2
+	fi
+	if [ $? -ne 0 ]; then
+		log error "Config init failed"
+		return 1
+	fi
+
+	handler_init
+	setpid
+
+	do_collect 
+}
+
+main $@
